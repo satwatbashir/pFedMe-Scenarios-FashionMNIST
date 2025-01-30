@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package fl;
+
+
+message ModelMetadata {
+  string data_source = 1;
+  float data_quality_score = 2;
+  int32 total_parameters = 3;
+  string timestamp = 4;
+  map<string, float> model_performance = 5;
+  string model_structure = 6;
+  float latency = 7;
+  float bandwidth = 8;
+  float reliability = 9;
+  float cpu_usage = 10;
+  float memory_consumption = 11;
+  int32 current_round = 12; 
+}
+
+
+message ModelParameters {
+  string client_id = 1;
+  bytes model_data = 2;
+  ModelMetadata metadata = 3;
+  string session_id = 4;
+}
+
+message ModelUpdate {
+  string edge_id = 1;
+  ModelMetadata metadata = 2;
+  bytes model_data = 3;
+}
+
+message HeartbeatMessage {
+  string session_id = 1;
+}
+
+message RecoveryRequest {
+  string session_id = 1;
+}
+
+message RecoveryData {
+  bytes model_data = 1;
+  string metadata = 2;
+}
+
+message Ack {
+  string message = 1;
+}
+
+message ModelRequest {
+  string client_id = 1;
+  string session_id = 2;
+  ModelMetadata metadata = 3;  // Added field
+}
+
+
+message ModelResponse {
+  bytes model_data = 1;
+  string message = 2;
+  int32 current_round = 3; 
+}
+
+message EdgeModelResponse {
+  repeated ModelUpdate model_updates = 1;
+}
+
+message Empty {}  // Required for ResetGlobalModel
+
+service FederatedLearningService {
+  rpc SendModelParameters(ModelParameters) returns (Ack) {}
+  rpc ReceiveModelUpdates(ModelUpdate) returns (Ack) {}
+  rpc Heartbeat(HeartbeatMessage) returns (Ack) {}
+  rpc RequestRecoveryData(RecoveryRequest) returns (RecoveryData) {}
+  rpc RequestGlobalModel(ModelRequest) returns (ModelResponse) {}
+  rpc ProvideModelUpdates(ModelRequest) returns (EdgeModelResponse) {}
+  rpc ResetGlobalModel(Empty) returns (Ack) {}
+
+
+}
