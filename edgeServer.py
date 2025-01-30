@@ -1,3 +1,6 @@
+# server_pfedme.py
+# (Functionally the same aggregator logic as FedProx/FedAvg, but works for pFedMe.)
+
 import grpc
 from concurrent import futures
 import torch
@@ -7,7 +10,7 @@ import logging
 import io
 from fashion_mnist_model import FashionMNISTCNN
 
-class FederatedProxService(fl_pb2_grpc.FederatedLearningServiceServicer):
+class PersonalizedFederatedService(fl_pb2_grpc.FederatedLearningServiceServicer):
     def __init__(self, num_clients=5):
         super().__init__()
         self.global_model = None
@@ -35,7 +38,6 @@ class FederatedProxService(fl_pb2_grpc.FederatedLearningServiceServicer):
             current_round=self.current_round  
         )
 
-
     def SendModelParameters(self, request, context):
         try:
             # Validate round synchronization
@@ -43,9 +45,11 @@ class FederatedProxService(fl_pb2_grpc.FederatedLearningServiceServicer):
             server_round = self.current_round
             
             if client_round != server_round:
-                msg = f"Rejecting update: Client round {client_round} vs server round {server_round}"
+                msg = (f"Rejecting update: Client round {client_round} vs "
+                       f"server round {server_round}")
                 print(msg)
                 return fl_pb2.Ack(message=f"{msg} (Server Round: {server_round})")
+            
             # Validate client ID format
             client_id = request.client_id
             if not (client_id.startswith("client") and client_id[6:].isdigit()):
@@ -59,6 +63,7 @@ class FederatedProxService(fl_pb2_grpc.FederatedLearningServiceServicer):
             if samples <= 0:
                 return fl_pb2.Ack(message="Invalid sample count derived from data quality score")
 
+            # Load the client's (personalized) model parameters
             try:
                 client_state = torch.load(
                     io.BytesIO(request.model_data),
@@ -82,10 +87,12 @@ class FederatedProxService(fl_pb2_grpc.FederatedLearningServiceServicer):
             print(f"[Round {server_round + 1}] Received update from {client_id} "
                   f"(samples: {samples}, progress: {len(self.received_updates[server_round])}/{self.num_clients})")
 
+            # Check if all clients have submitted in this round
             if len(self.received_updates[server_round]) < self.num_clients:
                 remaining = self.num_clients - len(self.received_updates[server_round])
                 return fl_pb2.Ack(message=f"Waiting for {remaining} more clients")
 
+            # Once all clients have submitted, aggregate
             print(f"\n[Round {server_round + 1}] Starting aggregation...")
             total_samples = sum(c["samples"] for c in self.received_updates[server_round].values())
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -100,7 +107,7 @@ class FederatedProxService(fl_pb2_grpc.FederatedLearningServiceServicer):
                     aggregated_state[param_name] += (client_data["params"][param_name].to(device).float() * weight)
 
             self.global_model = aggregated_state
-            
+
             del self.received_updates[server_round]
             self.current_round += 1
             
@@ -132,11 +139,12 @@ def serve():
         ('grpc.keepalive_permit_without_calls', 1)
     ])
     fl_pb2_grpc.add_FederatedLearningServiceServicer_to_server(
-        FederatedProxService(), server
+        PersonalizedFederatedService(), server  # class name unchanged
     )
     server.add_insecure_port('[::]:50051')
     server.start()
-    print("Fashion MNIST Server running on port 50051")  # Updated server identification
+    print("Fashion MNIST Server running on port 50051")
     server.wait_for_termination()
+
 if __name__ == '__main__':
     serve()
