@@ -1,6 +1,4 @@
 # server_pfedme.py
-# (Functionally the same aggregator logic as FedProx/FedAvg, but works for pFedMe.)
-
 import grpc
 from concurrent import futures
 import torch
