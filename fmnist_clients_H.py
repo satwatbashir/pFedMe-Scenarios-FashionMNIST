@@ -1,3 +1,5 @@
+# client_pfedme.py
+
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
@@ -17,18 +19,25 @@ import fl_proto_pb2 as fl_pb2
 import fl_proto_pb2_grpc as fl_pb2_grpc
 
 from fashion_mnist_model import FashionMNISTCNN
-# Hyperparameters
+
+# ------------------------------------------------------------------------------
+# Hyperparameters (only minor changes from FedProx)
+# ------------------------------------------------------------------------------
 local_lr = 0.01
 lr_decay = 0.997
 local_epochs = 3
 target_accuracy = 80.0
-# momentum = 0.9
 number_of_rounds = 300
-mu = 0.8
+
+# pFedMe-specific parameter: controls the proximity to global weights
+lambda_reg = 15.0
+
 base_data_source = 'FASHION-MNIST'
 session_id = str(uuid.uuid4())
 
+# ------------------------------------------------------------------------------
 # Set random seeds
+# ------------------------------------------------------------------------------
 def set_random_seeds(seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -37,14 +46,15 @@ def set_random_seeds(seed=42):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-# MNIST Normalization
+# ------------------------------------------------------------------------------
+# Basic transforms/augmentations (unchanged)
+# ------------------------------------------------------------------------------
 def base_transform():
     return [
         transforms.ToTensor(),
-        transforms.Normalize((0.2860,), (0.3530,))  # Fashion MNIST stats
+        transforms.Normalize((0.2860,), (0.3530,))  # Fashion-MNIST stats
     ]
 
-# Augmentations for different scenarios
 def fs_low():
     return [
         transforms.RandomRotation(5)
@@ -58,23 +68,22 @@ def fs_medium():
 
 def fs_high():
     return [
-        transforms.RandomRotation(15),  # Reduced from 30°
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),  # Mild translation
-        # transforms.ColorJitter(brightness=0.2, contrast=0.2)  # Simulate writing variations
+        transforms.RandomRotation(15),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         transforms.RandomAutocontrast(p=0.5)
-
     ]
 
-# Load full MNIST dataset
 def load_full_fmnist(train=True):
     return datasets.FashionMNIST(root='./data_fmnist', train=train, download=True)
 
-# Dirichlet Distribution
+# ------------------------------------------------------------------------------
+# Create Label Skew Indices (Dirichlet-based, unchanged)
+# ------------------------------------------------------------------------------
 def dirichlet_distribution(num_clients, num_classes, alpha):
     return np.random.dirichlet([alpha] * num_classes, num_clients)
 
-# Create Label Skew Indices
-def create_label_skew_indices(client_id, total_samples=60000, alpha_label=1, alpha_quantity=2.5, seed=42):
+def create_label_skew_indices(client_id, total_samples=60000, alpha_label=1,
+                              alpha_quantity=2.5, seed=42):
     client_num = int(client_id.split("client")[-1])
     np.random.seed(seed + client_num)
     random.seed(seed + client_num)
@@ -83,17 +92,14 @@ def create_label_skew_indices(client_id, total_samples=60000, alpha_label=1, alp
     all_targets = np.array(dataset.targets)
     num_classes = 10
     
-    # Explicit 5-client setup
     total_clients = 5
     quantity_proportions = np.random.dirichlet([alpha_quantity] * total_clients)
     client_total = int(quantity_proportions[client_num - 1] * total_samples)
     
-    # Class distribution
     class_proportions = np.random.dirichlet([alpha_label] * num_classes)
     class_allocations = (class_proportions * client_total).astype(int)
     class_allocations = np.maximum(class_allocations, 1)
     
-    # Redistribution logic
     current_total = np.sum(class_allocations)
     if current_total != client_total:
         diff = client_total - current_total
@@ -104,7 +110,6 @@ def create_label_skew_indices(client_id, total_samples=60000, alpha_label=1, alp
             largest_class = np.argmax(class_allocations[:-1])
             class_allocations[largest_class] -= deficit
 
-    # Collect indices
     indices = []
     for class_idx in range(num_classes):
         class_indices = np.where(all_targets == class_idx)[0]
@@ -112,8 +117,7 @@ def create_label_skew_indices(client_id, total_samples=60000, alpha_label=1, alp
         needed = min(class_allocations[class_idx], len(class_indices))
         indices.extend(class_indices[:needed].tolist())
     
-    # Ensure minimum samples
-    if len(indices) < 100:  # Example minimum
+    if len(indices) < 100:  # ensure a minimum
         needed = 100 - len(indices)
         extra = np.random.choice(np.arange(60000), needed, replace=False)
         indices.extend(extra.tolist())
@@ -121,12 +125,14 @@ def create_label_skew_indices(client_id, total_samples=60000, alpha_label=1, alp
     np.random.shuffle(indices)
     return indices
 
+# ------------------------------------------------------------------------------
 # Client Dataset
+# ------------------------------------------------------------------------------
 class ClientDataset(torch.utils.data.Dataset):
     def __init__(self, indices, transform):
         self.full_dataset = datasets.FashionMNIST(root='./data_fmnist', train=True, download=True)
         self.indices = indices
-        self.transform = transform  
+        self.transform = transform
             
     def __getitem__(self, idx):
         img, target = self.full_dataset[self.indices[idx]]
@@ -135,7 +141,9 @@ class ClientDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.indices)
 
-# Hybrid DataLoader for Federated Learning
+# ------------------------------------------------------------------------------
+# DataLoader builder (unchanged)
+# ------------------------------------------------------------------------------
 def build_hybrid_loader(client_id, scenario):
     scenario = scenario.upper()
     config = {
@@ -155,41 +163,77 @@ def build_hybrid_loader(client_id, scenario):
     train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     test_transform = transforms.Compose(base_transform())
-    test_dataset = datasets.FashionMNIST(root='./data_fmnist', train=False, transform=test_transform, download=True)
+    test_dataset = datasets.FashionMNIST(root='./data_fmnist', train=False,
+                                         transform=test_transform, download=True)
     test_loader = DataLoader(test_dataset, batch_size=64, num_workers=2, shuffle=False)
     
     return train_loader, test_loader
 
-# FedProx Training & Evaluation
-def fedprox_train_and_evaluate(model, global_params, device, train_loader, test_loader):
-    optimizer = torch.optim.SGD(model.parameters(), lr=local_lr)
-    global_params = {k: v.to(device).detach().clone() for k, v in global_params.items()}
+# ------------------------------------------------------------------------------
+# pFedMe Training & Evaluation
+# ------------------------------------------------------------------------------
+def pfedme_train_and_evaluate(model, global_params, device, train_loader, test_loader):
+    """
+    Implements pFedMe's local update:
+      1) Initialize local personalized parameters phi_i = global_params
+      2) For each local epoch, load phi_i into the model, do forward/backward
+         pass with cross-entropy + lambda_reg * ||phi_i - w_global||^2,
+         and update phi_i.
+      3) Evaluate the updated phi_i on local test data
+      4) Return final accuracy, average loss, and a dummy 0.0 (for legacy)
+    """
+    # Copy the incoming global model weights to device
+    w_global = {k: v.clone().to(device) for k, v in global_params.items()}
 
+    # Initialize local personalized parameters phi_i
+    phi_i = {k: v.clone() for k, v in w_global.items()}
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=local_lr)
     model.train()
+
     total_loss = 0.0
+
     for epoch in range(local_epochs):
         epoch_loss = 0.0
+
+        # Load phi_i into the model parameters
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                param.copy_(phi_i[name])
+
+        # One epoch of local training
         for data, target in train_loader:
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
-            
+
             outputs = model(data)
             ce_loss = torch.nn.functional.cross_entropy(outputs, target)
 
+            # pFedMe regularization term: lambda_reg/2 * ||phi_i - w_global||^2
             prox_term = 0.0
-            for n, p in model.named_parameters():
-                prox_term += torch.norm(p - global_params[n], p=2) ** 2
-            
-            loss = ce_loss + (mu / 2) * prox_term
+            for (n, p), (n_g, w_g) in zip(model.named_parameters(), w_global.items()):
+                prox_term += torch.norm(p - w_g, p=2) ** 2
+
+            loss = ce_loss + (lambda_reg / 2.0) * prox_term
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        
+
+        # After this epoch, update phi_i from the current model
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                phi_i[name] = param.clone()
+
         avg_epoch_loss = epoch_loss / len(train_loader)
         total_loss += avg_epoch_loss
         print(f"Epoch {epoch+1}/{local_epochs} | Loss: {avg_epoch_loss:.4f}")
 
+    # Evaluate the personalized model (phi_i)
     model.eval()
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            param.copy_(phi_i[name])
+
     correct, total = 0, 0
     with torch.no_grad():
         for data, target in test_loader:
@@ -198,13 +242,15 @@ def fedprox_train_and_evaluate(model, global_params, device, train_loader, test_
             _, predicted = torch.max(outputs.data, 1)
             total += target.size(0)
             correct += (predicted == target).sum().item()
-    
-    accuracy = 100 * correct / total
+
+    accuracy = 100.0 * correct / total
     avg_loss = total_loss / local_epochs
+
     return accuracy, avg_loss, 0.0
-# -----------------------------
-# gRPC Communication
-# -----------------------------
+
+# ------------------------------------------------------------------------------
+# gRPC Communication (unchanged)
+# ------------------------------------------------------------------------------
 def request_global_model(stub, client_id, session_id, metadata):
     try:
         response = stub.RequestGlobalModel(fl_pb2.ModelRequest(
@@ -217,13 +263,16 @@ def request_global_model(stub, client_id, session_id, metadata):
         print(f"[{client_id}] Model request failed: {e.code().name()}")
         return None
 
-
 def send_model_parameters(stub, model, accuracy, avg_loss, client_id, scenario, order_id, train_loader, round_num):
-    # Serialize model
+    """
+    For pFedMe, we still send 'model' parameters. But note that after local
+    training, 'model' is holding phi_i. That is, we copy phi_i into model
+    before calling send_model_parameters.
+    """
+    # Serialize model parameters
     buffer = io.BytesIO()
     torch.save(model.state_dict(), buffer)
     
-    # Create metadata
     metadata = fl_pb2.ModelMetadata(
         data_source=base_data_source,
         data_quality_score=len(train_loader.dataset)/60000,
@@ -232,10 +281,9 @@ def send_model_parameters(stub, model, accuracy, avg_loss, client_id, scenario, 
         model_performance={"accuracy": float(accuracy), "average_loss": float(avg_loss)},
         model_structure="FashionMNISTCNN",
         **simulate_network_parameters(),
-        current_round=round_num 
+        current_round=round_num
     )
     
-    # Create message
     message = fl_pb2.ModelParameters(
         client_id=client_id,
         model_data=buffer.getvalue(),
@@ -247,13 +295,13 @@ def send_model_parameters(stub, model, accuracy, avg_loss, client_id, scenario, 
         try:
             ack = stub.SendModelParameters(message, timeout=30)
             print(f"Server ACK: {ack.message}")
-            return True, ack  # Return both success and Ack
+            return True, ack
         except grpc.RpcError as e:
             wait_time = 2 ** attempt
             print(f"Attempt {attempt+1} failed: {e.code().name}")
             time.sleep(wait_time)
     print("Failed to send model parameters after 5 attempts.")
-    return False, None  # Return failure state
+    return False, None
 
 def simulate_network_parameters():
     return {
@@ -263,7 +311,6 @@ def simulate_network_parameters():
         'cpu_usage': float(np.random.uniform(30, 80)),
         'memory_consumption': float(np.random.uniform(200, 1000))
     }
-
 
 def save_training_metrics(client_id, scenario, order_id, round_num, accuracy, avg_loss):
     filename = f"training_metrics_fmnist_hybrid_{scenario.lower()}_{client_id}_order_{order_id}.csv"
@@ -280,9 +327,11 @@ def save_training_metrics(client_id, scenario, order_id, round_num, accuracy, av
             datetime.datetime.now().isoformat()
         ])
 
-
+# ------------------------------------------------------------------------------
+# Main Entry Point
+# ------------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="FedProx MNIST Client")
+    parser = argparse.ArgumentParser(description="FedProx MNIST Client (pFedMe variant)")
     parser.add_argument("--client_id", type=str, required=True)
     parser.add_argument("--scenario", type=str, required=True, choices=['LOW', 'MEDIUM', 'HIGH'])
     parser.add_argument("--order_id", type=int, required=True)
@@ -298,7 +347,7 @@ def main():
     # Model setup
     model = FashionMNISTCNN().to(device)
     
-    # gRPC setup
+    # gRPC channel setup
     channel = grpc.insecure_channel('localhost:50051', options=[
         ('grpc.max_send_message_length', 256*1024*1024),
         ('grpc.max_receive_message_length', 256*1024*1024),
@@ -308,7 +357,6 @@ def main():
     ])
     stub = fl_pb2_grpc.FederatedLearningServiceStub(channel)
     
-    # Initial metadata
     initial_metadata = fl_pb2.ModelMetadata(
         data_source=base_data_source,
         data_quality_score=len(train_loader.dataset)/60000,
@@ -319,7 +367,7 @@ def main():
     client_round = 0
     accuracy = 0.0
     while client_round < number_of_rounds:
-        # Get current server round with retry logic
+        # Try to get current server round
         server_round = None
         for attempt in range(5):
             try:
@@ -346,12 +394,11 @@ def main():
             print("Server completed all rounds. Exiting.")
             break
 
-        # Synchronization checks
+        # Sync checks
         if server_round > client_round:
             print(f"Server ahead (Round {server_round}), client syncing!")
             client_round = server_round
             continue
-
         if server_round < client_round:
             print(f"Client ahead (Client: {client_round}, Server: {server_round}), waiting!")
             time.sleep(5)
@@ -366,11 +413,12 @@ def main():
                 print(f"Error loading global model: {str(e)}")
                 continue
 
-        # Local training
+        # Local (pFedMe) training
         print(f"\n=== Participating in Round {server_round + 1}/{number_of_rounds} ===")
         initial_global_params = {k: v.clone() for k, v in model.state_dict().items()}
+
         try:
-            accuracy, avg_loss, _ = fedprox_train_and_evaluate(
+            accuracy, avg_loss, _ = pfedme_train_and_evaluate(
                 model, initial_global_params, device, train_loader, test_loader
             )
         except Exception as e:
@@ -394,7 +442,6 @@ def main():
         success = False
         for send_attempt in range(5):
             try:
-                # Verify server round hasn't changed
                 current_response = stub.RequestGlobalModel(fl_pb2.ModelRequest(
                     client_id=args.client_id,
                     session_id=session_id,
@@ -404,7 +451,7 @@ def main():
                     print(f"Server advanced to round {current_response.current_round} during training")
                     break
 
-                # Send parameters
+                # Send the (personalized) model parameters
                 send_success, ack = send_model_parameters(
                     stub=stub,
                     model=model,
